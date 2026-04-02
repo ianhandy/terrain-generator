@@ -246,6 +246,16 @@
     <input type="range" id="waterLevel" min="0" max="60" value="30" />
     <span class="value" id="waterLevelVal">30</span>
   </div>
+  <div class="control-group">
+    <label>River Erosion</label>
+    <input type="range" id="riverErosion" min="0" max="100" value="50" />
+    <span class="value" id="riverErosionVal">50</span>
+  </div>
+  <div class="control-group">
+    <label>River Width</label>
+    <input type="range" id="riverWidth" min="5" max="50" value="20" />
+    <span class="value" id="riverWidthVal">20</span>
+  </div>
   <button onclick="generate()">Generate</button>
   <button class="secondary" onclick="randomSeed()">Random</button>
   <button class="secondary" onclick="shareURL()">Share</button>
@@ -256,6 +266,8 @@
   <button id="btn-3d" class="active" onclick="setView('3d')">3D Isometric</button>
   <button id="btn-top" onclick="setView('top')">Top Down</button>
   <button id="btn-height" onclick="setView('height')">Heightmap</button>
+  <button id="btn-flow" onclick="setView('flow')">Flow</button>
+  <button id="btn-pressure" onclick="setView('pressure')">Pressure</button>
 </div>
 
 <div class="canvas-wrap">
@@ -376,6 +388,19 @@ function getTerrainColor(height, waterLevel) {
   return lerpColor([255, 233, 163], [255, 248, 220], (landH - 0.9) / 0.1);
 }
 
+// === Color with flow overlay ===
+function getColorWithFlow(height, waterLevel, fn) {
+  const base = getTerrainColor(height, waterLevel);
+  const wl = waterLevel / 100;
+  // Only overlay on land cells with actual flow
+  if (fn > 0 && height >= wl) {
+    const riverBlue = [20, 80, 140];
+    const blend = Math.min(1, fn * 2.5);
+    return lerpColor(base, riverBlue, blend);
+  }
+  return base;
+}
+
 function lerpColor(a, b, t) {
   t = Math.max(0, Math.min(1, t));
   return [
@@ -389,6 +414,8 @@ function lerpColor(a, b, t) {
 let currentView = '3d';
 let heightmap = null;
 let mapSize = 256;
+let flowMap = null;   // Float32Array, flow accumulation
+let flowNorm = null;  // Float32Array, log-normalized 0..1
 
 // Camera state for 3D view
 let camTilt = 0.5;   // 0 = flat top-down, 1 = full isometric. Constrained to [0.25, 0.75]
@@ -495,6 +522,102 @@ function generateHeightmap() {
   return map;
 }
 
+// === Flow Accumulation (D8 algorithm) ===
+function computeFlow() {
+  const erosionStrength = parseInt(document.getElementById('riverErosion').value) / 100;
+  const riverWidthVal = parseInt(document.getElementById('riverWidth').value);
+  const n = mapSize * mapSize;
+
+  // D8 neighbor offsets: E, SE, S, SW, W, NW, N, NE
+  const dx = [1, 1, 0, -1, -1, -1, 0, 1];
+  const dy = [0, 1, 1, 1, 0, -1, -1, -1];
+  // Diagonal distances: cardinal=1, diagonal=sqrt(2)
+  const dist = [1, Math.SQRT2, 1, Math.SQRT2, 1, Math.SQRT2, 1, Math.SQRT2];
+
+  // For each cell, find steepest downhill neighbor (D8 receiver)
+  const receiver = new Int32Array(n).fill(-1);
+
+  for (let y = 0; y < mapSize; y++) {
+    for (let x = 0; x < mapSize; x++) {
+      const i = y * mapSize + x;
+      const h = heightmap[i];
+      let maxSlope = 0;
+      let bestNeighbor = -1;
+
+      for (let d = 0; d < 8; d++) {
+        const nx = x + dx[d];
+        const ny = y + dy[d];
+        if (nx < 0 || nx >= mapSize || ny < 0 || ny >= mapSize) continue;
+        const ni = ny * mapSize + nx;
+        const slope = (h - heightmap[ni]) / dist[d];
+        if (slope > maxSlope) {
+          maxSlope = slope;
+          bestNeighbor = ni;
+        }
+      }
+      receiver[i] = bestNeighbor; // -1 if local sink
+    }
+  }
+
+  // Sort cells by height descending (topological order for D8 propagation)
+  const order = new Uint32Array(n);
+  for (let i = 0; i < n; i++) order[i] = i;
+  // Use a typed array sort with a comparator via indices
+  const heightmapRef = heightmap;
+  order.sort((a, b) => heightmapRef[b] - heightmapRef[a]);
+
+  // Propagate flow accumulation
+  const accum = new Float32Array(n).fill(1); // each cell starts with count of 1 (itself)
+  for (let k = 0; k < n; k++) {
+    const i = order[k];
+    const r = receiver[i];
+    if (r >= 0) {
+      accum[r] += accum[i];
+    }
+  }
+
+  flowMap = accum;
+
+  // Carve river beds
+  const threshold = mapSize * (riverWidthVal / 100);
+  let maxAccum = 0;
+  for (let i = 0; i < n; i++) {
+    if (accum[i] > maxAccum) maxAccum = accum[i];
+  }
+
+  if (maxAccum > threshold && erosionStrength > 0) {
+    const logDenom = Math.log(maxAccum / threshold);
+    for (let i = 0; i < n; i++) {
+      if (accum[i] >= threshold) {
+        const depth = Math.log(accum[i] / threshold) / logDenom * erosionStrength * 0.12;
+        heightmap[i] = Math.max(0, heightmap[i] - depth);
+      }
+    }
+    // Re-normalize heightmap to 0..1 after carving
+    let min = Infinity, max = -Infinity;
+    for (let i = 0; i < n; i++) {
+      if (heightmap[i] < min) min = heightmap[i];
+      if (heightmap[i] > max) max = heightmap[i];
+    }
+    const range = max - min || 1;
+    for (let i = 0; i < n; i++) {
+      heightmap[i] = (heightmap[i] - min) / range;
+    }
+  }
+
+  // Compute flowNorm after carving (recompute maxAccum since heightmap changed)
+  // maxAccum stays the same (flow topology doesn't change after carving)
+  flowNorm = new Float32Array(n);
+  if (maxAccum > threshold) {
+    const logDenom = Math.log(maxAccum / threshold);
+    for (let i = 0; i < n; i++) {
+      if (accum[i] >= threshold) {
+        flowNorm[i] = Math.min(1, Math.log(accum[i] / threshold) / logDenom);
+      }
+    }
+  }
+}
+
 // === Render: Top Down ===
 function renderTopDown(ctx, w, h) {
   const waterLevel = parseInt(document.getElementById('waterLevel').value);
@@ -502,9 +625,11 @@ function renderTopDown(ctx, w, h) {
 
   for (let y = 0; y < mapSize; y++) {
     for (let x = 0; x < mapSize; x++) {
-      const height = heightmap[y * mapSize + x];
-      const color = getTerrainColor(height, waterLevel);
-      const idx = (y * mapSize + x) * 4;
+      const i = y * mapSize + x;
+      const height = heightmap[i];
+      const fn = flowNorm ? flowNorm[i] : 0;
+      const color = getColorWithFlow(height, waterLevel, fn);
+      const idx = i * 4;
       imgData.data[idx] = color[0];
       imgData.data[idx + 1] = color[1];
       imgData.data[idx + 2] = color[2];
@@ -553,6 +678,115 @@ function renderHeightmap(ctx, w, h) {
   ctx.drawImage(tempCanvas, (w - s) / 2, (h - s) / 2, s, s);
 }
 
+// === Render: Flow accumulation map ===
+function renderFlow(ctx, w, h) {
+  const waterLevel = parseInt(document.getElementById('waterLevel').value);
+  const wl = waterLevel / 100;
+  const imgData = ctx.createImageData(mapSize, mapSize);
+
+  for (let y = 0; y < mapSize; y++) {
+    for (let x = 0; x < mapSize; x++) {
+      const i = y * mapSize + x;
+      const height = heightmap[i];
+      let color;
+
+      if (height < wl) {
+        // Water cells — normal water color
+        color = getTerrainColor(height, waterLevel);
+      } else {
+        // Land: color by flow accumulation
+        const fn = flowNorm ? flowNorm[i] : 0;
+        if (fn <= 0) {
+          // No flow — dark brown
+          color = lerpColor([20, 12, 4], [50, 30, 8], height);
+        } else {
+          // Flow: dark brown to bright blue
+          color = lerpColor([50, 30, 8], [20, 100, 200], Math.min(1, fn));
+        }
+      }
+
+      const idx = i * 4;
+      imgData.data[idx] = color[0];
+      imgData.data[idx + 1] = color[1];
+      imgData.data[idx + 2] = color[2];
+      imgData.data[idx + 3] = 255;
+    }
+  }
+
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = mapSize;
+  tempCanvas.height = mapSize;
+  tempCanvas.getContext('2d').putImageData(imgData, 0, 0);
+
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = '#241200';
+  ctx.fillRect(0, 0, w, h);
+  const s = Math.min(w, h) - 20;
+  ctx.drawImage(tempCanvas, (w - s) / 2, (h - s) / 2, s, s);
+}
+
+// === Render: Pressure / stream power heatmap ===
+function renderPressure(ctx, w, h) {
+  const imgData = ctx.createImageData(mapSize, mapSize);
+  const dx8 = [1, 1, 0, -1, -1, -1, 0, 1];
+  const dy8 = [0, 1, 1, 1, 0, -1, -1, -1];
+
+  for (let y = 0; y < mapSize; y++) {
+    for (let x = 0; x < mapSize; x++) {
+      const i = y * mapSize + x;
+      const h = heightmap[i];
+      const fn = flowNorm ? flowNorm[i] : 0;
+
+      // Compute local slope = |h - mean(neighbors)|
+      let neighborSum = 0;
+      let neighborCount = 0;
+      for (let d = 0; d < 8; d++) {
+        const nx = x + dx8[d];
+        const ny = y + dy8[d];
+        if (nx >= 0 && nx < mapSize && ny >= 0 && ny < mapSize) {
+          neighborSum += heightmap[ny * mapSize + nx];
+          neighborCount++;
+        }
+      }
+      const meanNeighbor = neighborCount > 0 ? neighborSum / neighborCount : h;
+      const slope = Math.abs(h - meanNeighbor);
+
+      const streamPower = Math.min(1, fn * slope * 5);
+
+      // Color gradient: 0=black, low=dark green, mid=yellow, high=red/orange
+      let color;
+      if (streamPower <= 0) {
+        color = [8, 8, 8];
+      } else if (streamPower < 0.25) {
+        color = lerpColor([8, 8, 8], [10, 60, 10], streamPower / 0.25);
+      } else if (streamPower < 0.5) {
+        color = lerpColor([10, 60, 10], [200, 180, 10], (streamPower - 0.25) / 0.25);
+      } else if (streamPower < 0.75) {
+        color = lerpColor([200, 180, 10], [229, 89, 28], (streamPower - 0.5) / 0.25);
+      } else {
+        color = lerpColor([229, 89, 28], [255, 40, 10], (streamPower - 0.75) / 0.25);
+      }
+
+      const idx = i * 4;
+      imgData.data[idx] = color[0];
+      imgData.data[idx + 1] = color[1];
+      imgData.data[idx + 2] = color[2];
+      imgData.data[idx + 3] = 255;
+    }
+  }
+
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = mapSize;
+  tempCanvas.height = mapSize;
+  tempCanvas.getContext('2d').putImageData(imgData, 0, 0);
+
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = '#241200';
+  ctx.fillRect(0, 0, w, h);
+  const s = Math.min(w, h) - 20;
+  ctx.drawImage(tempCanvas, (w - s) / 2, (h - s) / 2, s, s);
+}
+
 // === Render: 3D Isometric ===
 function render3D(ctx, w, h) {
   const waterLevel = parseInt(document.getElementById('waterLevel').value);
@@ -581,8 +815,10 @@ function render3D(ctx, w, h) {
   // Draw back-to-front for proper occlusion
   for (let y = 0; y < mapSize; y += step) {
     for (let x = 0; x < mapSize; x += step) {
-      const ht = heightmap[y * mapSize + x];
-      const color = getTerrainColor(ht, waterLevel);
+      const i = y * mapSize + x;
+      const ht = heightmap[i];
+      const fn = flowNorm ? flowNorm[i] : 0;
+      const color = getColorWithFlow(ht, waterLevel, fn);
 
       // Isometric transform with tilt
       const ix = (x - y) / step * (tileW * 0.5);
@@ -682,6 +918,8 @@ function render() {
     case 'top': renderTopDown(ctx, w, h); break;
     case 'height': renderHeightmap(ctx, w, h); break;
     case '3d': render3D(ctx, w, h); break;
+    case 'flow': renderFlow(ctx, w, h); break;
+    case 'pressure': renderPressure(ctx, w, h); break;
   }
 
   // Update info
@@ -697,6 +935,9 @@ function generate() {
   requestAnimationFrame(() => {
     setTimeout(() => {
       heightmap = generateHeightmap();
+      flowMap = null;
+      flowNorm = null;
+      computeFlow();
       render();
       loading.style.display = 'none';
     }, 16);
@@ -728,6 +969,8 @@ function shareURL() {
     lac: document.getElementById('lacunarity').value,
     elev: document.getElementById('elevation').value,
     water: document.getElementById('waterLevel').value,
+    erosion: document.getElementById('riverErosion').value,
+    rwidth: document.getElementById('riverWidth').value,
     view: currentView
   });
   const url = window.location.origin + window.location.pathname + '?' + params.toString();
@@ -753,12 +996,12 @@ function downloadImage() {
 // === Presets ===
 function applyPreset(name) {
   const presets = {
-    mountains: { octaves: 7, scale: 90, persistence: 55, lacunarity: 22, elevation: 70, waterLevel: 15 },
-    islands: { octaves: 6, scale: 70, persistence: 50, lacunarity: 20, elevation: 45, waterLevel: 45 },
-    mesa: { octaves: 4, scale: 120, persistence: 35, lacunarity: 18, elevation: 40, waterLevel: 10 },
-    valleys: { octaves: 6, scale: 60, persistence: 60, lacunarity: 25, elevation: 55, waterLevel: 25 },
-    alien: { octaves: 8, scale: 40, persistence: 70, lacunarity: 30, elevation: 60, waterLevel: 20 },
-    archipelago: { octaves: 5, scale: 50, persistence: 45, lacunarity: 20, elevation: 35, waterLevel: 55 }
+    mountains:   { octaves: 7, scale: 90,  persistence: 55, lacunarity: 22, elevation: 70, waterLevel: 15, erosion: 50, rwidth: 20 },
+    islands:     { octaves: 6, scale: 70,  persistence: 50, lacunarity: 20, elevation: 45, waterLevel: 45, erosion: 50, rwidth: 20 },
+    mesa:        { octaves: 4, scale: 120, persistence: 35, lacunarity: 18, elevation: 40, waterLevel: 10, erosion: 50, rwidth: 20 },
+    valleys:     { octaves: 6, scale: 60,  persistence: 60, lacunarity: 25, elevation: 55, waterLevel: 25, erosion: 50, rwidth: 20 },
+    alien:       { octaves: 8, scale: 40,  persistence: 70, lacunarity: 30, elevation: 60, waterLevel: 20, erosion: 50, rwidth: 20 },
+    archipelago: { octaves: 5, scale: 50,  persistence: 45, lacunarity: 20, elevation: 35, waterLevel: 55, erosion: 50, rwidth: 20 }
   };
 
   const p = presets[name];
@@ -770,6 +1013,8 @@ function applyPreset(name) {
   document.getElementById('lacunarity').value = p.lacunarity;
   document.getElementById('elevation').value = p.elevation;
   document.getElementById('waterLevel').value = p.waterLevel;
+  document.getElementById('riverErosion').value = p.erosion;
+  document.getElementById('riverWidth').value = p.rwidth;
   updateSliderLabels();
   generate();
 }
@@ -783,20 +1028,24 @@ function updateSliderLabels() {
   document.getElementById('lacunarityVal').textContent = (parseInt(document.getElementById('lacunarity').value) / 10).toFixed(1);
   document.getElementById('elevationVal').textContent = document.getElementById('elevation').value;
   document.getElementById('waterLevelVal').textContent = document.getElementById('waterLevel').value;
+  document.getElementById('riverErosionVal').textContent = document.getElementById('riverErosion').value;
+  document.getElementById('riverWidthVal').textContent = document.getElementById('riverWidth').value;
 }
 
 // === URL Params ===
 function loadFromURL() {
   const params = new URLSearchParams(window.location.search);
-  if (params.has('seed')) document.getElementById('seedInput').value = params.get('seed');
-  if (params.has('size')) document.getElementById('mapSizeSlider').value = params.get('size');
-  if (params.has('oct')) document.getElementById('octaves').value = params.get('oct');
-  if (params.has('scale')) document.getElementById('scale').value = params.get('scale');
-  if (params.has('pers')) document.getElementById('persistence').value = params.get('pers');
-  if (params.has('lac')) document.getElementById('lacunarity').value = params.get('lac');
-  if (params.has('elev')) document.getElementById('elevation').value = params.get('elev');
-  if (params.has('water')) document.getElementById('waterLevel').value = params.get('water');
-  if (params.has('view')) currentView = params.get('view');
+  if (params.has('seed'))    document.getElementById('seedInput').value = params.get('seed');
+  if (params.has('size'))    document.getElementById('mapSizeSlider').value = params.get('size');
+  if (params.has('oct'))     document.getElementById('octaves').value = params.get('oct');
+  if (params.has('scale'))   document.getElementById('scale').value = params.get('scale');
+  if (params.has('pers'))    document.getElementById('persistence').value = params.get('pers');
+  if (params.has('lac'))     document.getElementById('lacunarity').value = params.get('lac');
+  if (params.has('elev'))    document.getElementById('elevation').value = params.get('elev');
+  if (params.has('water'))   document.getElementById('waterLevel').value = params.get('water');
+  if (params.has('erosion')) document.getElementById('riverErosion').value = params.get('erosion');
+  if (params.has('rwidth'))  document.getElementById('riverWidth').value = params.get('rwidth');
+  if (params.has('view'))    currentView = params.get('view');
 }
 
 // === Init ===
